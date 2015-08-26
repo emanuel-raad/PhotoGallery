@@ -1,16 +1,17 @@
 package com.example.emanuel.photogallery;
 
-import android.graphics.Bitmap;
-import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.os.AsyncTask;
 import android.os.Bundle;
-import android.os.Handler;
 import android.support.v4.app.Fragment;
 import android.support.v7.widget.GridLayoutManager;
 import android.support.v7.widget.RecyclerView;
+import android.support.v7.widget.SearchView;
 import android.util.Log;
 import android.view.LayoutInflater;
+import android.view.Menu;
+import android.view.MenuInflater;
+import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
@@ -28,15 +29,23 @@ public class PhotoGalleryFragment extends Fragment {
 
     private RecyclerView mPhotoRecyclerView;
     private List<GalleryItem> mItems = new ArrayList<>();
-    private ThumbnailDownloader<PhotoHolder> mThumbnailDownloader;
+    // Old way thread
+    // private ThumbnailDownloader<PhotoHolder> mThumbnailDownloader;
 
-    private Integer mPage;
+    private int mPage;
+    private int mReturnedItems;
+    private int mNumberOfColumns;
+    private int mRow;
+    private List<Integer> mLoadedRows = new ArrayList<>();
     private boolean mLoading;
+    private boolean mSearchMode;
     private int mVisibleItemCount, mTotalItemCount, mPastVisibleItems;
 
     private static final String TAG = "PhotoGalleryFragment";
     private static final String PAGE_NUMBER = "page_number";
+    private static final String LOADED_PICS = "loaded_pics";
     private static final int PRELOADED_IMAGES = 10;
+    private static final int PRELOADED_ROWS = 3;
     private static final int COLUMN_WIDTH = 360;
 
 
@@ -47,15 +56,19 @@ public class PhotoGalleryFragment extends Fragment {
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        setHasOptionsMenu(true);
         setRetainInstance(true);
 
         if (savedInstanceState != null) {
-            mPage = (Integer) savedInstanceState.getSerializable(PAGE_NUMBER);
+            mPage = (int) savedInstanceState.getSerializable(PAGE_NUMBER);
+            mReturnedItems = (int) savedInstanceState.getSerializable(LOADED_PICS);
         } else {
             mPage = 1;
+            mReturnedItems = 0;
         }
 
-        new FetchItemsTask().execute();
+        //updateItems();
+        new FetchItemsTask(null, mPage).execute();
 
         // Not needed anymore because Picasso handles all the images downloads
         // Left as a reference
@@ -78,7 +91,7 @@ public class PhotoGalleryFragment extends Fragment {
 
         // Just debug stuff. Not actually needed
         Picasso.with(getActivity()).setIndicatorsEnabled(true);
-        Picasso.with(getActivity()).setLoggingEnabled(true);
+        Picasso.with(getActivity()).setLoggingEnabled(false);
     }
 
     @Override
@@ -86,6 +99,61 @@ public class PhotoGalleryFragment extends Fragment {
         super.onDestroy();
         //mThumbnailDownloader.quit();
         //Log.i(TAG, "Background thread destroyed.");
+    }
+
+    @Override
+    public void onCreateOptionsMenu(Menu menu, MenuInflater inflater) {
+        super.onCreateOptionsMenu(menu, inflater);
+        inflater.inflate(R.menu.fragment_photo_gallery, menu);
+
+        MenuItem searchItem = menu.findItem(R.id.menu_item_search);
+        final SearchView searchView = (SearchView) searchItem.getActionView();
+
+        searchView.setOnQueryTextListener(new SearchView.OnQueryTextListener() {
+            @Override
+            public boolean onQueryTextSubmit(String query) {
+                Log.d(TAG, "QueryTextSubmit: " + query);
+                QueryPreferences.setStoredQuery(getActivity(), query);
+                mSearchMode = true;
+                mItems.clear();
+                mReturnedItems = 0;
+                mLoadedRows.clear();
+                mPhotoRecyclerView.scrollToPosition(0);
+                updateItems();
+                return true;
+            }
+
+            @Override
+            public boolean onQueryTextChange(String newText) {
+                Log.d(TAG, "QueryTextChange: " + newText);
+                return false;
+            }
+        });
+
+        searchView.setOnSearchClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                String query = QueryPreferences.getStoredQuery(getActivity());
+                searchView.setQuery(query, false);
+            }
+        });
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        switch (item.getItemId()) {
+            case R.id.menu_item_clear:
+                QueryPreferences.setStoredQuery(getActivity(), null);
+                updateItems();
+                return true;
+            default:
+                return super.onOptionsItemSelected(item);
+        }
+    }
+
+    private void updateItems() {
+        String query = mSearchMode ? QueryPreferences.getStoredQuery(getActivity()) : null;
+        new FetchItemsTask(query, mPage).execute();
     }
 
     @Override
@@ -102,9 +170,9 @@ public class PhotoGalleryFragment extends Fragment {
                     public void onGlobalLayout() {
                         mPhotoRecyclerView.getViewTreeObserver().removeOnGlobalLayoutListener(this);
                         int width = mPhotoRecyclerView.getMeasuredWidth();
-                        int numberOfColumns = width / COLUMN_WIDTH;
+                        mNumberOfColumns = width / COLUMN_WIDTH;
                         mPhotoRecyclerView.setLayoutManager(new GridLayoutManager(
-                                getActivity(), numberOfColumns));
+                                getActivity(), mNumberOfColumns));
                         mPhotoRecyclerView.getLayoutManager().requestLayout();
                     }
                 }
@@ -118,22 +186,32 @@ public class PhotoGalleryFragment extends Fragment {
                 mVisibleItemCount = lm.getChildCount();
                 mTotalItemCount = lm.getItemCount();
                 mPastVisibleItems = lm.findFirstVisibleItemPosition();
+                mRow = (mVisibleItemCount + mPastVisibleItems) / mNumberOfColumns;
 
-                for (int i = 0; i <= PRELOADED_IMAGES; i++) {
-                    int nextPic = mVisibleItemCount + mPastVisibleItems + i + 1;
-                    if (!mLoading) {
-                        if (nextPic >= (mTotalItemCount)) {
-                            mLoading = false;
-                            nextPage();
-                            Log.d(TAG, "Loading next page");
-                        } else {
-                            Picasso.with(getActivity()).load(mItems.get(nextPic).getUrl()).fetch();
-                            Log.d(TAG, "Preloaded picture #: " + nextPic + " URL: " + mItems.get(nextPic).getUrl());
+                //This is really messy
+                for (int i = 0; i <= PRELOADED_ROWS; i++) {
+                    int row = mRow + i;
+                    if (!mLoadedRows.contains(row)) {
+                        for (int j = 0; j < mNumberOfColumns; j++) {
+                            int nextPic = mVisibleItemCount + mPastVisibleItems + j;
+                            if (!mLoading) {
+                                try {
+                                    Picasso.with(getActivity()).load(mItems.get(i + nextPic).getUrl()).fetch();
+                                    Log.d(TAG, "Preloaded picture #: " + (i + nextPic) + " URL: " + mItems.get(nextPic).getUrl());
+                                } catch (IndexOutOfBoundsException e) {
+                                    mLoading = false;
+                                    mPage += 1;
+                                    updateItems();
+                                    Log.d(TAG, "Loading next page: ", e);
+                                }
+                            }
                         }
+                        mLoadedRows.add(row);
                     }
                 }
             }
         });
+
         setupAdapter();
 
         return view;
@@ -150,11 +228,7 @@ public class PhotoGalleryFragment extends Fragment {
     public void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
         outState.putSerializable(PAGE_NUMBER, mPage);
-    }
-
-    private void nextPage() {
-        mPage += 1;
-        new FetchItemsTask().execute();
+        outState.putSerializable(LOADED_PICS, mReturnedItems);
     }
 
     private void setupAdapter() {
@@ -222,16 +296,32 @@ public class PhotoGalleryFragment extends Fragment {
     }
 
     private class FetchItemsTask extends AsyncTask<Void, Void, List<GalleryItem>> {
+        private String mQuery;
+        private int mPage;
+
+        public FetchItemsTask(String query, int page) {
+            mQuery = query;
+            mPage = page;
+        }
+
+        public FetchItemsTask(int page) {
+            this(null, page);
+        }
 
         //Runs on a background thread
         @Override
         protected List<GalleryItem> doInBackground(Void... voids) {
-            return new FlickrFetchr().fetchItems(Integer.toString(mPage));
+            if (mQuery == null) {
+                return new FlickrFetchr().fetchRecentPhotos(mPage);
+            } else {
+                return new FlickrFetchr().searchPhotos(mQuery, mPage);
+            }
         }
 
         //Runs on the main thread
         @Override
         protected void onPostExecute(List<GalleryItem> galleryItems) {
+            mReturnedItems += galleryItems.size();
             mItems.addAll(galleryItems);
             mLoading = false;
             mPhotoRecyclerView.getAdapter().notifyDataSetChanged();
